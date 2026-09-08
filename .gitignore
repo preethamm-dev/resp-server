@@ -1,0 +1,27 @@
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Runtime artefacts
+*.aof
+*.rdb
+dump.rdb
+appendonly.aof
+appendonlydir/
+*.log
+
+# Benchmark scratch (committed results live in benchmarks/results/)
+benchmarks/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
