@@ -1,15 +1,13 @@
 package com.preetham.respserver.server;
 
 import com.preetham.respserver.command.ClientSession;
-import com.preetham.respserver.command.CommandContext;
-import com.preetham.respserver.command.CommandRegistry;
+import com.preetham.respserver.command.CommandExecutor;
 import com.preetham.respserver.protocol.ProtocolException;
 import com.preetham.respserver.protocol.ReadBuffer;
 import com.preetham.respserver.protocol.RespReader;
 import com.preetham.respserver.protocol.RespValue;
 import com.preetham.respserver.protocol.RespWriter;
 import com.preetham.respserver.stats.ServerStats;
-import com.preetham.respserver.store.Database;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
@@ -58,8 +56,7 @@ final class Connection implements Runnable {
     private static final int IO_BUFFER_SIZE = 16 * 1024;
 
     private final Socket socket;
-    private final Database database;
-    private final CommandRegistry registry;
+    private final CommandExecutor executor;
     private final ServerStats stats;
     private final boolean verbose;
 
@@ -68,13 +65,11 @@ final class Connection implements Runnable {
     private final ReadBuffer inbound = new ReadBuffer();
 
     Connection(Socket socket,
-               Database database,
-               CommandRegistry registry,
+               CommandExecutor executor,
                ServerStats stats,
                boolean verbose) {
         this.socket = socket;
-        this.database = database;
-        this.registry = registry;
+        this.executor = executor;
         this.stats = stats;
         this.verbose = verbose;
     }
@@ -177,8 +172,7 @@ final class Connection implements Runnable {
             args.add(bulk);
         }
 
-        CommandContext ctx = new CommandContext(args, database, session, stats, registry);
-        return Optional.of(registry.dispatch(ctx));
+        return Optional.of(executor.execute(args, session));
     }
 
     /**

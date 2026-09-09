@@ -1,9 +1,8 @@
 package com.preetham.respserver.server;
 
-import com.preetham.respserver.command.CommandRegistry;
+import com.preetham.respserver.command.CommandExecutor;
 import com.preetham.respserver.config.ServerConfig;
 import com.preetham.respserver.stats.ServerStats;
-import com.preetham.respserver.store.Database;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -40,8 +39,7 @@ import java.util.concurrent.TimeUnit;
 public final class VirtualThreadServer implements RedisServer {
 
     private final ServerConfig config;
-    private final Database database;
-    private final CommandRegistry registry;
+    private final CommandExecutor executor;
     private final ServerStats stats;
 
     private volatile ServerSocket serverSocket;
@@ -50,12 +48,10 @@ public final class VirtualThreadServer implements RedisServer {
     private volatile boolean running;
 
     public VirtualThreadServer(ServerConfig config,
-                               Database database,
-                               CommandRegistry registry,
+                               CommandExecutor executor,
                                ServerStats stats) {
         this.config = config;
-        this.database = database;
-        this.registry = registry;
+        this.executor = executor;
         this.stats = stats;
     }
 
@@ -90,7 +86,7 @@ public final class VirtualThreadServer implements RedisServer {
                 }
 
                 connectionExecutor.submit(
-                        new Connection(client, database, registry, stats, config.verbose()));
+                        new Connection(client, executor, stats, config.verbose()));
 
             } catch (SocketException e) {
                 // close() closes the listening socket, which lands here. Expected.

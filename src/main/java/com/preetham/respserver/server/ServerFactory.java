@@ -1,9 +1,8 @@
 package com.preetham.respserver.server;
 
-import com.preetham.respserver.command.CommandRegistry;
+import com.preetham.respserver.command.CommandExecutor;
 import com.preetham.respserver.config.ServerConfig;
 import com.preetham.respserver.stats.ServerStats;
-import com.preetham.respserver.store.Database;
 
 /**
  * Builds the server implementation named by {@link ServerConfig#mode()}.
@@ -20,11 +19,10 @@ public final class ServerFactory {
     }
 
     public static RedisServer create(ServerConfig config,
-                                     Database database,
-                                     CommandRegistry registry,
+                                     CommandExecutor executor,
                                      ServerStats stats) {
         return switch (config.mode()) {
-            case VIRTUAL_THREADS -> new VirtualThreadServer(config, database, registry, stats);
+            case VIRTUAL_THREADS -> new VirtualThreadServer(config, executor, stats);
             case EVENT_LOOP -> throw new UnsupportedOperationException(
                     "the event-loop server is not implemented yet; use --mode virtual");
         };

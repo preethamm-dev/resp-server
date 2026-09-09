@@ -129,7 +129,7 @@ public final class ConnectionCommands {
                 "# Server",
                 "redis_version:7.0.0",
                 "server_name:resp-server",
-                "resp_server_version:0.1.0",
+                "resp_server_version:0.2.0",
                 "os:" + System.getProperty("os.name"),
                 "arch_bits:64",
                 "process_id:" + ProcessHandle.current().pid(),
