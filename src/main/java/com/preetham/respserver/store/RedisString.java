@@ -40,6 +40,15 @@ public record RedisString(byte[] value) implements RedisObject {
         return "string";
     }
 
+    /**
+     * Always false. An empty string value is still a live key -- {@code SET k ""} then
+     * {@code EXISTS k} replies 1 -- unlike an empty collection, which Redis deletes.
+     */
+    @Override
+    public boolean isEmpty() {
+        return false;
+    }
+
     public int length() {
         return value.length;
     }
