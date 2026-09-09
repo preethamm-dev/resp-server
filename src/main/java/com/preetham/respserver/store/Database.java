@@ -1,11 +1,15 @@
 package com.preetham.respserver.store;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * The keyspace: a concurrent map from key to {@link ValueHolder}.
@@ -56,12 +60,38 @@ public final class Database {
         this(System::currentTimeMillis);
     }
 
+    /**
+     * Counts mutations that actually changed the dataset.
+     *
+     * <h2>Why this exists</h2>
+     *
+     * The append-only file must record a command only if it really modified something.
+     * Appending unconditionally looks harmless but is not: {@code SET k v NX} against an
+     * existing key changes nothing, yet replaying it into an empty keyspace at startup
+     * <em>would</em> create the key. The dataset after recovery would differ from the one
+     * that was saved.
+     *
+     * <p>So the command layer samples this counter before and after a handler runs and
+     * persists only when it moved. Redis solves the same problem the same way, with its
+     * {@code server.dirty} counter.
+     */
+    private final LongAdder dirty = new LongAdder();
+
     public Database(LongSupplier clock) {
         this.clock = clock;
     }
 
     public long now() {
         return clock.getAsLong();
+    }
+
+    /** Number of dataset-changing operations so far. See {@link #dirty}. */
+    public long dirtyCount() {
+        return dirty.sum();
+    }
+
+    private void markDirty() {
+        dirty.increment();
     }
 
     // ---- reads -----------------------------------------------------------------
@@ -85,19 +115,85 @@ public final class Database {
     }
 
     /**
+     * The value, checked against an expected type.
+     *
+     * <p>Reads do not take the keyspace lock. That is safe because the value returned is
+     * either immutable ({@link RedisString}) or internally synchronised (the collection
+     * types), so a reader can never observe a half-applied mutation. It does mean a read
+     * racing a {@code DEL} may return data from a key that has just been deleted, which
+     * is a benign ordering question rather than a correctness one -- the read is simply
+     * ordered before the delete.
+     *
+     * @throws WrongTypeException if the key holds a different type
+     */
+    public <T extends RedisObject> Optional<T> getAs(String key, Class<T> type) {
+        ValueHolder holder = liveHolder(key);
+        if (holder == null) {
+            return Optional.empty();
+        }
+        if (!type.isInstance(holder.value())) {
+            throw new WrongTypeException();
+        }
+        return Optional.of(type.cast(holder.value()));
+    }
+
+    /**
      * The value as a string.
      *
      * @throws WrongTypeException if the key holds another type
      */
     public Optional<RedisString> getString(String key) {
-        ValueHolder holder = liveHolder(key);
-        if (holder == null) {
-            return Optional.empty();
-        }
-        if (!(holder.value() instanceof RedisString s)) {
-            throw new WrongTypeException();
-        }
-        return Optional.of(s);
+        return getAs(key, RedisString.class);
+    }
+
+    /**
+     * Runs a mutation against a collection value, creating the key if it is absent and
+     * deleting it if the mutation leaves the collection empty.
+     *
+     * <p>The whole sequence -- type check, create-if-absent, mutate, delete-if-empty --
+     * happens inside {@code compute}, so it is atomic with respect to every other
+     * operation on that key. Doing it as separate get/mutate/put calls would allow a
+     * concurrent {@code DEL} to land in the middle and lose the write.
+     *
+     * <p>An existing TTL is preserved: pushing onto a list that expires in ten seconds
+     * must not make it immortal.
+     *
+     * @param factory  builds an empty collection when the key does not exist
+     * @param mutation applied to the collection; its result is returned to the caller
+     */
+    public <T extends RedisObject, R> R mutateCollection(String key,
+                                                         Class<T> type,
+                                                         Supplier<T> factory,
+                                                         Function<T, R> mutation) {
+        List<R> result = new ArrayList<>(1);
+        keyspace.compute(key, (k, existing) -> {
+            T target;
+            long expireAt = ValueHolder.NO_EXPIRY;
+
+            if (existing != null && !existing.isExpired(now())) {
+                if (!type.isInstance(existing.value())) {
+                    throw new WrongTypeException();
+                }
+                target = type.cast(existing.value());
+                expireAt = existing.expireAtMillis();
+            } else {
+                target = factory.get();
+            }
+
+            result.add(mutation.apply(target));
+
+            // Redis has no concept of an empty collection: the key goes with the last
+            // element. Returning null from compute removes the mapping.
+            return target.isEmpty() ? null : new ValueHolder(target, expireAt);
+        });
+
+        // Marked dirty unconditionally rather than asking the mutation whether it
+        // changed anything. Over-recording is harmless here: replaying an SREM of an
+        // absent member or an LPOP of a missing key is a no-op, so recovery still
+        // reproduces the same dataset. The conditional string writes above cannot take
+        // that shortcut, because replaying a failed NX would create a key.
+        markDirty();
+        return result.get(0);
     }
 
     public boolean exists(String key) {
@@ -146,10 +242,12 @@ public final class Database {
     /** Unconditional set, clearing any existing TTL (this is Redis's {@code SET} behaviour). */
     public void set(String key, RedisObject value) {
         keyspace.put(key, ValueHolder.of(value));
+        markDirty();
     }
 
     public void set(String key, RedisObject value, long expireAtMillis) {
         keyspace.put(key, new ValueHolder(value, expireAtMillis));
+        markDirty();
     }
 
     /** {@code SET ... NX} -- store only if the key is absent or expired. */
@@ -162,6 +260,9 @@ public final class Database {
             stored[0] = true;
             return new ValueHolder(value, expireAtMillis);
         });
+        if (stored[0]) {
+            markDirty();
+        }
         return stored[0];
     }
 
@@ -177,11 +278,17 @@ public final class Database {
             stored[0] = true;
             return new ValueHolder(value, expireAtMillis);
         });
+        if (stored[0]) {
+            markDirty();
+        }
         return stored[0];
     }
 
     public boolean delete(String key) {
         ValueHolder removed = keyspace.remove(key);
+        if (removed != null) {
+            markDirty();
+        }
         // A key already past its deadline counts as absent, so deleting it reports 0.
         return removed != null && !removed.isExpired(now());
     }
@@ -197,6 +304,9 @@ public final class Database {
     }
 
     public void flushAll() {
+        if (!keyspace.isEmpty()) {
+            markDirty();
+        }
         keyspace.clear();
     }
 
@@ -238,6 +348,7 @@ public final class Database {
             result[0] = next;
             return new ValueHolder(RedisString.of(next), expireAt);
         });
+        markDirty();
         return result[0];
     }
 
@@ -262,6 +373,7 @@ public final class Database {
             newLength[0] = appended.length();
             return new ValueHolder(appended, expireAt);
         });
+        markDirty();
         return newLength[0];
     }
 
@@ -271,6 +383,9 @@ public final class Database {
     public boolean expireAt(String key, long atMillis) {
         ValueHolder updated = keyspace.computeIfPresent(key, (k, existing) ->
                 existing.isExpired(now()) ? null : existing.withExpiry(atMillis));
+        if (updated != null) {
+            markDirty();
+        }
         return updated != null;
     }
 
@@ -287,6 +402,9 @@ public final class Database {
             changed[0] = true;
             return existing.persistent();
         });
+        if (changed[0]) {
+            markDirty();
+        }
         return changed[0];
     }
 
@@ -302,10 +420,67 @@ public final class Database {
         return holder.hasExpiry() ? holder.ttlMillis(now()) : TTL_NO_EXPIRY;
     }
 
-    // ---- internals used by the active expiry cycle (day 2) ----------------------
+    // ---- support for the active expiry cycle -----------------------------------
 
-    /** Live view of the backing map. Package-private: only the expiry cycle needs it. */
-    ConcurrentHashMap<String, ValueHolder> keyspace() {
-        return keyspace;
+    /**
+     * Rotating cursor for {@link #sampleKeysForExpiry}. Guarded by {@code this}; the
+     * expiry task is the only caller and there is exactly one of it.
+     */
+    private Iterator<String> expiryCursor;
+
+    /**
+     * Returns up to {@code count} keys for the expiry cycle to examine, resuming where
+     * the previous call left off and wrapping around at the end.
+     *
+     * <h2>Why a cursor rather than random sampling</h2>
+     *
+     * Redis picks random keys from a dedicated dictionary of keys that have a TTL, which
+     * it can do in O(1). Neither half of that is available here: {@link ConcurrentHashMap}
+     * offers no O(1) random selection, and maintaining a parallel index of volatile keys
+     * would mean touching a second structure on every {@code SET}, {@code EXPIRE},
+     * {@code PERSIST} and {@code DEL} -- bookkeeping on the hot path to speed up a
+     * background task.
+     *
+     * <p>A rotating cursor gives the same eventual coverage with bounded work per cycle.
+     * It wastes some effort on keys that have no TTL, which is the cost of not keeping
+     * that second index. The iterator is weakly consistent, so concurrent writes never
+     * make it throw; it may simply miss or repeat a key, which for a best-effort reaper
+     * is harmless.
+     */
+    synchronized List<String> sampleKeysForExpiry(int count) {
+        List<String> sample = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            if (expiryCursor == null || !expiryCursor.hasNext()) {
+                if (keyspace.isEmpty()) {
+                    break;
+                }
+                expiryCursor = keyspace.keySet().iterator();
+                if (!expiryCursor.hasNext()) {
+                    break;
+                }
+            }
+            sample.add(expiryCursor.next());
+        }
+        return sample;
+    }
+
+    /**
+     * Removes a key if it is past its deadline.
+     *
+     * @return true if the key was expired and has now been removed
+     */
+    boolean reapIfExpired(String key) {
+        ValueHolder holder = keyspace.get(key);
+        if (holder == null || !holder.isExpired(now())) {
+            return false;
+        }
+        // Remove only if it is still the same holder -- a concurrent SET may have
+        // replaced it with a fresh value between the check and the removal.
+        return keyspace.remove(key, holder);
+    }
+
+    /** Number of entries including any that are expired but not yet reaped. */
+    int rawSize() {
+        return keyspace.size();
     }
 }
