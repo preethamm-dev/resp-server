@@ -205,7 +205,7 @@ public final class RespReader {
      * strings so the rest of the server cannot tell the difference.
      */
     private Optional<RespValue> parseInline(ByteBuffer buf) throws ProtocolException {
-        Optional<String> line = readLine(buf);
+        Optional<String> line = readInlineLine(buf);
         if (line.isEmpty()) {
             return Optional.empty();
         }
@@ -242,6 +242,39 @@ public final class RespReader {
         // peer is not speaking RESP, and waiting for more would just consume memory.
         if (limit - start > MAX_LINE_LENGTH) {
             throw new ProtocolException("line exceeds " + MAX_LINE_LENGTH + " bytes without CRLF");
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Reads an inline command line, terminated by LF with an optional preceding CR.
+     *
+     * <p>Inline commands are deliberately more forgiving than RESP frames. A RESP frame is
+     * machine-generated and the specification mandates CRLF, so accepting anything else
+     * there would mask genuine corruption. An inline command is typed by a human or
+     * produced by a shell, and neither reliably emits CR -- {@code echo "PING"} sends a
+     * bare LF, as do telnet on most platforms and anything piped from a script. Real Redis
+     * splits inline input on LF and strips a trailing CR if present; requiring CRLF makes
+     * the server look broken to exactly the casual client that inline mode exists for.
+     */
+    private static Optional<String> readInlineLine(ByteBuffer buf) throws ProtocolException {
+        int start = buf.position();
+        int limit = buf.limit();
+
+        for (int i = start; i < limit; i++) {
+            if (buf.get(i) == '\n') {
+                int end = (i > start && buf.get(i - 1) == '\r') ? i - 1 : i;
+                int length = end - start;
+                byte[] line = new byte[length];
+                buf.get(start, line, 0, length);
+                buf.position(i + 1);
+                return Optional.of(new String(line, StandardCharsets.US_ASCII));
+            }
+        }
+
+        if (limit - start > MAX_LINE_LENGTH) {
+            throw new ProtocolException(
+                    "inline command exceeds " + MAX_LINE_LENGTH + " bytes without a newline");
         }
         return Optional.empty();
     }
