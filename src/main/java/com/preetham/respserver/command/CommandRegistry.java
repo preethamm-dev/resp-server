@@ -2,6 +2,10 @@ package com.preetham.respserver.command;
 
 import com.preetham.respserver.command.impl.ConnectionCommands;
 import com.preetham.respserver.command.impl.GenericCommands;
+import com.preetham.respserver.command.impl.HashCommands;
+import com.preetham.respserver.command.impl.ListCommands;
+import com.preetham.respserver.command.impl.SetCommands;
+import com.preetham.respserver.command.impl.SortedSetCommands;
 import com.preetham.respserver.command.impl.StringCommands;
 import com.preetham.respserver.protocol.RespValue;
 import com.preetham.respserver.store.RedisDataException;
@@ -50,6 +54,10 @@ public final class CommandRegistry {
         ConnectionCommands.registerInto(specs);
         GenericCommands.registerInto(specs);
         StringCommands.registerInto(specs);
+        ListCommands.registerInto(specs);
+        HashCommands.registerInto(specs);
+        SetCommands.registerInto(specs);
+        SortedSetCommands.registerInto(specs);
         return new CommandRegistry(specs);
     }
 

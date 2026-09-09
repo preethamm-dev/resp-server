@@ -2,8 +2,10 @@ package com.preetham.respserver.command;
 
 import com.preetham.respserver.protocol.RespValue;
 import com.preetham.respserver.stats.ServerStats;
+import com.preetham.respserver.store.Bytes;
 import com.preetham.respserver.store.Database;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
@@ -83,6 +85,20 @@ public final class CommandContext {
     /** Raw bytes of argument {@code i}. Use for values, which are binary safe. */
     public byte[] argBytes(int i) {
         return args.get(i).value();
+    }
+
+    /** Argument {@code i} as a binary-safe value, for collection members and fields. */
+    public Bytes argValue(int i) {
+        return new Bytes(args.get(i).value());
+    }
+
+    /** Arguments from {@code first} to the end, as binary-safe values. */
+    public List<Bytes> argValuesFrom(int first) {
+        List<Bytes> values = new ArrayList<>(args.size() - first);
+        for (int i = first; i < args.size(); i++) {
+            values.add(new Bytes(args.get(i).value()));
+        }
+        return values;
     }
 
     /**
