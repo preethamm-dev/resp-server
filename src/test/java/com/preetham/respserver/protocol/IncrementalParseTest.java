@@ -166,6 +166,34 @@ class IncrementalParseTest {
     }
 
     @Test
+    @DisplayName("an inline command ending in a bare LF is accepted, as real Redis does")
+    void parsesInlineCommandsTerminatedByBareLineFeed() throws Exception {
+        RespReader serverReader = RespReader.forServer();
+
+        // What `echo "SET foo bar" | nc` actually sends. Requiring CRLF here makes the
+        // server look broken to shell pipelines and telnet, which is the whole audience
+        // for inline commands.
+        Optional<RespValue> parsed =
+                serverReader.tryParse(ByteBuffer.wrap(wire("SET foo bar\n")));
+
+        assertThat(parsed).contains(RespValue.array(List.of(
+                RespValue.bulk("SET"), RespValue.bulk("foo"), RespValue.bulk("bar"))));
+    }
+
+    @Test
+    void drainsSeveralLineFeedTerminatedInlineCommands() throws Exception {
+        RespReader serverReader = RespReader.forServer();
+        ByteBuffer buf = ByteBuffer.wrap(wire("PING\nPING\nPING\n"));
+
+        int parsed = 0;
+        while (serverReader.tryParse(buf).isPresent()) {
+            parsed++;
+        }
+
+        assertThat(parsed).isEqualTo(3);
+    }
+
+    @Test
     void inlineCommandIsAlsoIncremental() throws Exception {
         RespReader serverReader = RespReader.forServer();
         byte[] bytes = wire("PING\r\n");

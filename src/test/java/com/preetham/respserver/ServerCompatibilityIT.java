@@ -3,6 +3,7 @@ package com.preetham.respserver;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.preetham.respserver.command.CommandExecutor;
 import com.preetham.respserver.command.CommandRegistry;
 import com.preetham.respserver.config.ServerConfig;
 import com.preetham.respserver.server.RedisServer;
@@ -45,11 +46,15 @@ class ServerCompatibilityIT {
 
     @BeforeEach
     void startServer() throws IOException {
-        ServerConfig config = new ServerConfig(
-                "127.0.0.1", 0, ServerConfig.ServerMode.VIRTUAL_THREADS, 100, false);
+        ServerConfig config = ServerConfig.forTests(ServerConfig.ServerMode.VIRTUAL_THREADS);
 
-        server = ServerFactory.create(config, new Database(), CommandRegistry.standard(),
-                new ServerStats());
+        Database database = new Database();
+        CommandRegistry registry = CommandRegistry.standard();
+        ServerStats stats = new ServerStats();
+        // No AOF writer: persistence has its own dedicated suite.
+        CommandExecutor executor = new CommandExecutor(registry, database, stats, null);
+
+        server = ServerFactory.create(config, executor, stats);
         server.start();
 
         jedis = new Jedis("127.0.0.1", server.port());
@@ -277,6 +282,267 @@ class ServerCompatibilityIT {
 
             assertThat(jedis.expire("k", -1)).isEqualTo(1);
             assertThat(jedis.exists("k")).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("lists")
+    class Lists {
+
+        @Test
+        @DisplayName("LPUSH reverses, RPUSH appends -- together they make a FIFO queue")
+        void pushOrderMatchesRedis() {
+            jedis.lpush("stack", "a", "b", "c");
+            assertThat(jedis.lrange("stack", 0, -1)).containsExactly("c", "b", "a");
+
+            jedis.rpush("queue", "a", "b", "c");
+            assertThat(jedis.lrange("queue", 0, -1)).containsExactly("a", "b", "c");
+        }
+
+        @Test
+        void popFromBothEnds() {
+            jedis.rpush("k", "first", "middle", "last");
+
+            assertThat(jedis.lpop("k")).isEqualTo("first");
+            assertThat(jedis.rpop("k")).isEqualTo("last");
+            assertThat(jedis.llen("k")).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("popping the last element removes the key entirely")
+        void emptyListsDoNotExist() {
+            jedis.rpush("k", "only");
+            jedis.lpop("k");
+
+            assertThat(jedis.exists("k")).isFalse();
+            assertThat(jedis.type("k")).isEqualTo("none");
+        }
+
+        @Test
+        void lrangeClampsRatherThanFailing() {
+            jedis.rpush("k", "a", "b", "c", "d", "e");
+
+            assertThat(jedis.lrange("k", 0, -1)).hasSize(5);
+            assertThat(jedis.lrange("k", 1, 3)).containsExactly("b", "c", "d");
+            assertThat(jedis.lrange("k", -2, -1)).containsExactly("d", "e");
+            assertThat(jedis.lrange("k", 100, 200)).isEmpty();
+            assertThat(jedis.lrange("missing", 0, -1)).isEmpty();
+        }
+
+        @Test
+        void lindexHonoursNegativeIndices() {
+            jedis.rpush("k", "a", "b", "c");
+
+            assertThat(jedis.lindex("k", 0)).isEqualTo("a");
+            assertThat(jedis.lindex("k", -1)).isEqualTo("c");
+            assertThat(jedis.lindex("k", 99)).isNull();
+        }
+
+        @Test
+        void popWithCountReturnsAnArray() {
+            jedis.rpush("k", "a", "b", "c", "d");
+
+            assertThat(jedis.lpop("k", 2)).containsExactly("a", "b");
+            assertThat(jedis.llen("k")).isEqualTo(2);
+        }
+    }
+
+    @Nested
+    @DisplayName("hashes")
+    class Hashes {
+
+        @Test
+        void setGetAndDelete() {
+            assertThat(jedis.hset("h", "field", "value")).isEqualTo(1);
+            assertThat(jedis.hset("h", "field", "updated"))
+                    .as("overwriting an existing field counts as zero additions").isEqualTo(0);
+            assertThat(jedis.hget("h", "field")).isEqualTo("updated");
+            assertThat(jedis.hdel("h", "field")).isEqualTo(1);
+            assertThat(jedis.exists("h")).as("last field removed, key goes too").isFalse();
+        }
+
+        @Test
+        void getAllReturnsAMap() {
+            jedis.hset("h", java.util.Map.of("a", "1", "b", "2"));
+
+            assertThat(jedis.hgetAll("h")).containsEntry("a", "1").containsEntry("b", "2");
+            assertThat(jedis.hlen("h")).isEqualTo(2);
+            assertThat(jedis.hkeys("h")).containsExactlyInAnyOrder("a", "b");
+            assertThat(jedis.hvals("h")).containsExactlyInAnyOrder("1", "2");
+        }
+
+        @Test
+        void existsAndMissingFields() {
+            jedis.hset("h", "present", "yes");
+
+            assertThat(jedis.hexists("h", "present")).isTrue();
+            assertThat(jedis.hexists("h", "absent")).isFalse();
+            assertThat(jedis.hget("h", "absent")).isNull();
+            assertThat(jedis.hgetAll("missing")).isEmpty();
+        }
+
+        @Test
+        @DisplayName("the deprecated HMSET is still supported, because Jedis sends it")
+        void hmsetWorks() {
+            jedis.hmset("h", java.util.Map.of("x", "1", "y", "2"));
+
+            assertThat(jedis.hgetAll("h")).hasSize(2);
+        }
+    }
+
+    @Nested
+    @DisplayName("sets")
+    class Sets {
+
+        @Test
+        void addIsIdempotentAndReportsNewMembersOnly() {
+            assertThat(jedis.sadd("s", "a", "b")).isEqualTo(2);
+            assertThat(jedis.sadd("s", "b", "c")).as("only c is new").isEqualTo(1);
+            assertThat(jedis.scard("s")).isEqualTo(3);
+        }
+
+        @Test
+        void membershipAndRemoval() {
+            jedis.sadd("s", "a", "b", "c");
+
+            assertThat(jedis.sismember("s", "a")).isTrue();
+            assertThat(jedis.sismember("s", "z")).isFalse();
+            assertThat(jedis.smembers("s")).containsExactlyInAnyOrder("a", "b", "c");
+            assertThat(jedis.srem("s", "a", "missing")).isEqualTo(1);
+        }
+
+        @Test
+        void removingEveryMemberRemovesTheKey() {
+            jedis.sadd("s", "only");
+            jedis.srem("s", "only");
+
+            assertThat(jedis.exists("s")).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("sorted sets")
+    class SortedSets {
+
+        @Test
+        void ordersByScoreThenLexicographically() {
+            jedis.zadd("z", 2, "charlie");
+            jedis.zadd("z", 1, "alice");
+            jedis.zadd("z", 2, "bob");
+
+            assertThat(jedis.zrange("z", 0, -1)).containsExactly("alice", "bob", "charlie");
+            assertThat(jedis.zrevrange("z", 0, -1)).containsExactly("charlie", "bob", "alice");
+        }
+
+        @Test
+        void scoresAndRanks() {
+            jedis.zadd("z", 10, "a");
+            jedis.zadd("z", 20, "b");
+            jedis.zadd("z", 30, "c");
+
+            assertThat(jedis.zscore("z", "b")).isEqualTo(20.0);
+            assertThat(jedis.zscore("z", "missing")).isNull();
+            assertThat(jedis.zrank("z", "a")).isZero();
+            assertThat(jedis.zrank("z", "c")).isEqualTo(2);
+            assertThat(jedis.zrevrank("z", "c")).isZero();
+            assertThat(jedis.zrank("z", "missing")).isNull();
+            assertThat(jedis.zcard("z")).isEqualTo(3);
+        }
+
+        @Test
+        void withScoresInterleavesMembersAndScores() {
+            jedis.zadd("z", 1.5, "a");
+            jedis.zadd("z", 2, "b");
+
+            var withScores = jedis.zrangeWithScores("z", 0, -1);
+
+            assertThat(withScores).hasSize(2);
+            assertThat(withScores.get(0).getElement()).isEqualTo("a");
+            assertThat(withScores.get(0).getScore()).isEqualTo(1.5);
+            assertThat(withScores.get(1).getScore()).isEqualTo(2.0);
+        }
+
+        @Test
+        @DisplayName("a whole score comes back as \"3\", not \"3.0\"")
+        void wholeScoresAreFormattedWithoutADecimalPoint() {
+            jedis.zadd("z", 3, "member");
+
+            Object raw = jedis.sendCommand(() -> "ZSCORE".getBytes(), "z", "member");
+
+            assertThat(new String((byte[]) raw)).isEqualTo("3");
+        }
+
+        @Test
+        void updatingAScoreReorders() {
+            jedis.zadd("z", 1, "a");
+            jedis.zadd("z", 2, "b");
+
+            jedis.zadd("z", 99, "a");
+
+            assertThat(jedis.zrange("z", 0, -1)).containsExactly("b", "a");
+        }
+
+        @Test
+        void incrementAdjustsTheScore() {
+            jedis.zadd("z", 10, "a");
+
+            assertThat(jedis.zincrby("z", 5, "a")).isEqualTo(15.0);
+            assertThat(jedis.zincrby("z", 1, "fresh")).isEqualTo(1.0);
+        }
+
+        @Test
+        void removingEveryMemberRemovesTheKey() {
+            jedis.zadd("z", 1, "only");
+            jedis.zrem("z", "only");
+
+            assertThat(jedis.exists("z")).isFalse();
+        }
+    }
+
+    @Nested
+    @DisplayName("type discipline across all five types")
+    class TypeDiscipline {
+
+        @Test
+        @DisplayName("every type rejects commands meant for another")
+        void mismatchedCommandsRaiseWrongType() {
+            jedis.set("string", "v");
+            jedis.rpush("list", "v");
+            jedis.hset("hash", "f", "v");
+            jedis.sadd("set", "v");
+            jedis.zadd("zset", 1, "v");
+
+            assertThat(jedis.type("string")).isEqualTo("string");
+            assertThat(jedis.type("list")).isEqualTo("list");
+            assertThat(jedis.type("hash")).isEqualTo("hash");
+            assertThat(jedis.type("set")).isEqualTo("set");
+            assertThat(jedis.type("zset")).isEqualTo("zset");
+
+            assertThatThrownBy(() -> jedis.lpush("string", "x"))
+                    .isInstanceOf(JedisDataException.class).hasMessageContaining("WRONGTYPE");
+            assertThatThrownBy(() -> jedis.get("list"))
+                    .isInstanceOf(JedisDataException.class).hasMessageContaining("WRONGTYPE");
+            assertThatThrownBy(() -> jedis.sadd("hash", "x"))
+                    .isInstanceOf(JedisDataException.class).hasMessageContaining("WRONGTYPE");
+            assertThatThrownBy(() -> jedis.zadd("set", 1, "x"))
+                    .isInstanceOf(JedisDataException.class).hasMessageContaining("WRONGTYPE");
+            assertThatThrownBy(() -> jedis.incr("zset"))
+                    .isInstanceOf(JedisDataException.class).hasMessageContaining("WRONGTYPE");
+
+            // And the connection is still perfectly usable after all of that.
+            assertThat(jedis.ping()).isEqualTo("PONG");
+        }
+
+        @Test
+        @DisplayName("a TTL set on a collection is preserved by later mutations")
+        void collectionsKeepTheirExpiry() {
+            jedis.rpush("k", "a");
+            jedis.expire("k", 100);
+
+            jedis.rpush("k", "b");
+
+            assertThat(jedis.ttl("k")).as("pushing must not make the key immortal")
+                    .isBetween(99L, 100L);
         }
     }
 
