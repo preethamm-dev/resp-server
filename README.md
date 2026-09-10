@@ -2,33 +2,20 @@
 
 A Redis-compatible server written from scratch in Java 21, with **zero runtime
 dependencies** — no Netty, no client libraries, just the JDK. The official `redis-cli`
-connects to it and cannot tell the difference for the commands it implements.
+connects to it and cannot tell the difference for the 63 commands it implements.
 
-> **Work in progress.** Days 1 and 2 of 3 are complete: the RESP2 protocol, all five data
-> types, key expiry, AOF persistence with crash recovery, and the virtual-thread server.
-> Day 3 adds the single-threaded NIO event loop and benchmarks against real Redis.
-
-## Try it
+It is built **twice**: once with a virtual thread per connection, once as a single-threaded
+NIO event loop, behind one interface over one command layer and one keyspace — then
+benchmarked against each other and against real Redis 8.0.5.
 
 ```bash
-mvn -B verify
-java -jar target/resp-server.jar --port 6380
-
-# in another terminal, with the official client
+mvn verify && java -jar target/resp-server.jar --port 6380
 redis-cli -p 6380
 ```
 
 ```
 127.0.0.1:6380> SET greeting "hello world"
 OK
-127.0.0.1:6380> APPEND greeting "!"
-(integer) 12
-127.0.0.1:6380> RPUSH queue a b c
-(integer) 3
-127.0.0.1:6380> LRANGE queue 0 -1
-1) "a"
-2) "b"
-3) "c"
 127.0.0.1:6380> ZADD board 42 alice 17 bob
 (integer) 2
 127.0.0.1:6380> ZRANGE board 0 -1 WITHSCORES
@@ -44,33 +31,88 @@ OK
 (integer) 60
 ```
 
-It also speaks the inline protocol, so a raw socket works:
+Switch concurrency model with a flag:
 
 ```bash
-printf 'PING\nECHO hello\n' | nc 127.0.0.1 6380
+java -jar target/resp-server.jar --mode virtual     # a virtual thread per connection
+java -jar target/resp-server.jar --mode eventloop   # one thread, NIO selector
 ```
 
-## Why this exists
+---
 
-Writing a Redis clone is a well-worn exercise; most stop at a toy that echoes `PONG`.
-The parts of this one worth reading are the parts those skip:
+## The question this was built to answer
 
-- **An incremental parser.** TCP is a byte stream, not a message stream. One `read()`
-  can return half a command or thirty-seven of them. The parser either consumes exactly
-  one complete frame or leaves the buffer untouched — proven by a test that feeds every
-  frame **one byte at a time** and requires it to return nothing until the final byte.
-  Pipelining then falls out for free.
-- **A hand-written skip list with span tracking**, so `ZRANK` is O(log n) rather than a
-  scan — tested against a `TreeSet` oracle because a randomised structure cannot be
-  checked with fixed expectations.
-- **Durability proven by killing the process.** Not a mocked failure: `SIGKILL`, mid-write,
-  then restart and check.
-- **Two concurrency models, benchmarked against each other** *(day 3)*. The same command
-  layer and keyspace sit behind both a virtual-thread-per-connection server and a
-  single-threaded NIO event loop, so a benchmark isolates exactly one variable.
-- **Compatibility proven by a third-party client.** The integration suite drives the
-  server with **Jedis**, written by people who have never seen this code. That is a much
-  stronger claim than "my parser agrees with my writer".
+Java 21 shipped virtual threads, and the claim attached to them is that
+thread-per-connection — the design non-blocking I/O was invented to escape — is viable
+again. That is a claim you can measure.
+
+So the server exists in two forms sharing everything above the transport, and the **entire
+52-test compatibility suite runs against both**, so the comparison is between concurrency
+models rather than between two different servers.
+
+### What the measurements showed
+
+Official `redis-benchmark`, warmup discarded, median of 3 runs, spread reported. Full
+method, environment and caveats in **[docs/benchmarks.md](docs/benchmarks.md)**.
+
+**Unpipelined, 50 connections:**
+
+| subject | ops/sec (median) | p99 |
+|---|---:|---:|
+| resp-server, event loop | 123,609 | 0.487 ms |
+| resp-server, virtual threads | 53,619 | 0.967 ms |
+| Redis 8.0.5 | 124,688 | 0.447 ms |
+
+**Pipeline depth 16:**
+
+| subject | ops/sec (median) |
+|---|---:|
+| Redis 8.0.5 | 1,373,626 |
+| resp-server, event loop | 917,431 |
+| resp-server, virtual threads | 761,035 |
+
+**The honest reading.** Unpipelined, the event loop is ~2.3× the virtual-thread mode and is
+within measurement noise of Redis — but that is because at that rate *both* servers are
+bottlenecked on syscalls, not because the implementations are equivalent. Pipelining
+amortises the syscalls away, and there **Redis is 1.5–1.7× ahead**. That is the
+configuration that actually measures the server, and this one loses it.
+
+Virtual threads made thread-per-connection **viable**, not **competitive**. That is a
+narrower claim than the marketing, and it is what the data supports.
+
+---
+
+## What is worth reading in here
+
+Writing a Redis clone is a well-worn exercise; most stop at a toy that echoes `PONG`. These
+are the parts those skip.
+
+**An incremental parser, written first.** TCP is a byte stream, not a message stream. One
+`read()` can return half a command or thirty-seven of them. `RespReader.tryParse` either
+consumes exactly one complete frame or leaves the buffer untouched — proven by a test that
+feeds every frame **one byte at a time** and requires it to return nothing until the final
+byte. Pipelining, the event loop and crash recovery all fell out of that decision for free.
+([ADR 0003](docs/adr/0003-incremental-parser.md))
+
+**A hand-written skip list with span tracking**, so `ZRANK` is O(log n) rather than a scan.
+A span bug is *silent* — ordering stays correct and only `ZRANK` lies — so the tests compare
+against a `TreeSet` oracle on **rank**, not just order.
+([ADR 0004](docs/adr/0004-skiplist-for-sorted-sets.md))
+
+**Partial writes handled properly.** `write()` returns how many bytes the kernel accepted,
+which can be fewer than offered. The remainder is buffered and `OP_WRITE` registered — and
+then **deregistered**, because leaving it makes `select()` spin at 100% CPU while the server
+still appears to work. No functional test catches that, so there is one that measures the
+event loop thread's CPU time while idle.
+
+**Durability proven by killing the process.** Not a mocked failure:
+`scripts/crash-recovery-demo.sh` sends `SIGKILL` mid-write, restarts, and verifies.
+
+**Compatibility proven by a third-party client.** The suite drives the server with **Jedis**,
+written by people who have never seen this code. It found a real bug: Jedis sends the legacy
+standalone `SETNX`, which the server did not implement.
+
+---
 
 ## Architecture
 
@@ -81,26 +123,29 @@ The parts of this one worth reading are the parts those skip:
               │   RedisServer (iface) │
      ┌────────┴────────┐     ┌────────┴─────────┐
      │VirtualThread     │     │  EventLoop       │
-     │Server            │     │  Server (day 3)  │
-     │1 vthread/conn    │     │  single-threaded │
+     │Server            │     │  Server          │
+     │1 vthread/conn    │     │  1 thread, NIO   │
+     │blocking I/O      │     │  selector        │
+     │needs locking     │     │  no locking      │
      └────────┬────────┘     └────────┬─────────┘
               └───────────┬───────────┘
-                    RespReader  ── incremental, never blocks
+                    RespReader  ── incremental: whole frame or nothing
                           │
-                  CommandExecutor  ── persists only real mutations
+                  CommandExecutor  ── dirty-counter gate → AOF
                           │
-                   CommandRegistry  ── arity + type validation
+                   CommandRegistry  ── arity + type validation, never throws
                           │
-                      Database  ── ConcurrentHashMap keyspace,
-                          │          atomic per-key compute
-      ┌───────────┬───────┴───────┬────────────┬─────────────┐
-  RedisString  RedisList     RedisHash    RedisSet    RedisSortedSet
-                                                       (hash + skip list)
+                      Database  ── ConcurrentHashMap, atomic per-key compute
+      ┌──────────┬──────────┼──────────┬─────────────┐
+  RedisString RedisList RedisHash  RedisSet  RedisSortedSet
+                                              (HashMap + SkipList)
                           │
-                   ExpiryManager  ── lazy on read, adaptive sampling in background
+                   ExpiryManager  ── lazy on read + adaptive background sweep
                           │
-                     AofWriter → appendonly.aof → AofLoader on restart
+                     AofWriter → appendonly.aof → AofLoader at startup
 ```
+
+---
 
 ## Commands
 
@@ -114,62 +159,30 @@ The parts of this one worth reading are the parts those skip:
 | Set | `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SCARD` |
 | Sorted set | `ZADD` `ZINCRBY` `ZSCORE` `ZRANGE` `ZREVRANGE` `ZRANK` `ZREVRANK` `ZREM` `ZCARD` |
 
-## Sorted sets: two structures, one collection
+Inline commands work too, so a raw socket is enough:
 
-A sorted set holds a `HashMap` **and** a skip list over the same data, which is how Redis
-implements it. Neither alone works: `ZSCORE` must be O(1), which rules out a skip list
-alone; `ZRANGE` and `ZRANK` need ordering, which a hash map cannot give.
+```bash
+printf 'PING\nECHO hello\n' | nc 127.0.0.1 6380
+```
 
-The skip list is written by hand rather than delegating to `TreeMap`, because of `ZRANK`.
-A balanced tree answers "how many elements precede this one" in O(n) unless every node
-also stores a subtree size, which must then be repaired up the whole path on each
-rotation. A skip list stores a **span** on each forward pointer — how many nodes it jumps
-— so rank falls out of the same descent that finds the element, for free.
-
-Span maintenance is also the easiest thing to get subtly wrong, and the failure is quiet:
-ordering stays correct, `ZRANGE` looks fine, and only `ZRANK` returns wrong numbers. So
-the tests compare against a `TreeSet` oracle on **rank**, not just order, and
-`checkInvariants` independently verifies that every span equals the distance it claims.
-
-## Expiry
-
-Two mechanisms, because either alone is insufficient:
-
-- **Lazy** — a key past its deadline reads as absent and is deleted on access. Correct,
-  but a key nobody reads again is never reclaimed.
-- **Active** — a background cycle samples 20 keys, deletes the expired ones, and if more
-  than a quarter of the sample was expired, immediately goes again (capped at 16 rounds).
-  The feedback loop means the reaper costs almost nothing when little is expiring and
-  works hard exactly when a lot is, without ever scanning the whole keyspace.
-
-Redis samples randomly from a dedicated dictionary of keys that have a TTL. This server
-uses a rotating cursor over the keyspace instead: `ConcurrentHashMap` offers no O(1)
-random selection, and maintaining a parallel index would mean extra bookkeeping on every
-`SET` and `DEL` to speed up a background task. The cursor gives the same eventual coverage
-with bounded work per cycle, at the cost of some wasted looks at keys with no TTL.
+---
 
 ## Persistence and crash recovery
 
-Every command that actually changes the dataset is appended to a file, as the RESP array
-the client sent. Replaying them rebuilds the keyspace.
+Every command that actually changes the dataset is appended to a file as the RESP array the
+client sent. Replaying rebuilds the keyspace.
 
-**Only real mutations are recorded.** `SET k v NX` against an existing key changes
-nothing, but replaying it into an empty keyspace *would* create the key — so recovery
-would produce a different dataset from the one that was saved. A dirty counter on the
-keyspace is sampled before and after each command, and the command is persisted only if
-it moved. Redis solves the same problem the same way.
+**Only real mutations are recorded.** `SET k v NX` against an existing key changes nothing,
+but replaying it into an empty keyspace *would* create the key — recovery producing a
+different dataset from the one that was saved. A dirty counter is sampled either side of
+each command and only a genuine change is persisted. Redis solves the same problem the same
+way. ([ADR 0005](docs/adr/0005-aof-persistence.md))
 
-fsync policy is configurable: `always` (nothing acknowledged is ever lost, slow),
-`everysec` (default; at most one second lost to a power cut, nothing lost to a process
-crash), or `no`.
-
-### The crash test
-
-`scripts/crash-recovery-demo.sh` kills the server with `SIGKILL` while writes are in
-flight, restarts it, and verifies. `SIGKILL` cannot be caught: no shutdown hook, no flush,
-no close. Anything that survives does so because it was already on disk.
+fsync policy is configurable: `always`, `everysec` (default), `no`.
 
 ```
+$ ./scripts/crash-recovery-demo.sh
+
 === 3. SIGKILL the server while more writes are still in flight ===
     killed pid 9267 with SIGKILL -- no hook, no flush, no close
     still running     : no
@@ -179,53 +192,19 @@ no close. Anything that survives does so because it was already on disk.
   restored    19021 commands, 19021 keys
 
 === 5. verify ===
-    keys before crash : 5004
-    keys after restart: 19021
-    key:1             : value:1
-    key:5000          : value:5000
-    queue             : a,b,c
-    profile.name      : preetham
-    tags              : java,redis
-    board score       : 42
+    keys before crash : 5004      key:1        : value:1
+    keys after restart: 19021     queue        : a,b,c
+                                  profile.name : preetham
+                                  board score  : 42
 
 PASS  20 sampled keys all present, 19021 >= 5004, server writable again
 ```
 
-The count is higher after the restart than before it because the writer was still pushing
-keys when the process died, and those had been fsynced too.
+`SIGKILL` cannot be caught — no shutdown hook, no flush, no close. Anything that survived
+was already on disk. A record cut off mid-append is discarded and the file truncated to the
+last complete frame, because leaving the fragment would corrupt everything written after it.
 
-A record cut off mid-append is discarded and the file truncated to the last complete
-frame — otherwise the fragment would be parsed as the start of whatever got written next
-and corrupt everything after it. The parser makes this easy for the reason it was built
-that way on day one: it already distinguishes "not enough bytes yet" from "malformed", and
-at the end of a file the former simply means "this record was never finished".
-
-## What this is not
-
-Stated plainly, because a portfolio project that overclaims is worse than one that does
-less honestly. There is **no** replication, clustering, transactions (`MULTI`), Lua
-scripting, pub/sub, blocking commands (`BLPOP`), `SCAN` cursors, RESP3, or RDB snapshots.
-One database rather than sixteen. It is a learning and benchmarking project, not a Redis
-replacement.
-
-`INFO` reports `redis_version:7.0.0` as a compatibility shim, because clients gate feature
-detection on that field. The adjacent `server_name` and `resp_server_version` say what it
-actually is.
-
-### Known limitations
-
-- **`MSET` is not atomic across keys.** Single-key commands are atomic — the store does
-  read-modify-write inside `ConcurrentHashMap.compute` — but multi-key commands write one
-  key at a time, so a concurrent reader can see a half-applied batch. Real Redis avoids
-  this by being single-threaded. Fixing it here would need a global lock, which would cost
-  more than it buys; the event-loop mode on day 3 does not have the problem at all.
-- **The AOF is never rewritten.** It grows with the number of writes, not the size of the
-  data: a counter incremented a million times is one key but a million records. Redis
-  periodically rewrites the log as the shortest command sequence that recreates the
-  current state. That is not implemented.
-- **AOF appends are serialised on one lock**, because the log has to record the same order
-  the keyspace applied. Under many concurrent writers that lock is a real bottleneck —
-  another cost single-threaded Redis does not pay.
+---
 
 ## Testing
 
@@ -233,34 +212,89 @@ actually is.
 mvn -B verify
 ```
 
-**204 tests**: 142 unit, 62 integration.
+**267 tests: 142 unit, 125 integration.**
 
 | Suite | What it establishes |
 |---|---|
-| `RespCodecTest` | Every RESP2 type encodes and parses; malformed input is rejected rather than guessed at; encode→parse round-trips, including binary payloads and UTF-8 |
-| `IncrementalParseTest` | Frames survive arbitrary fragmentation, fed one byte at a time; an incomplete parse consumes nothing; pipelined batches drain fully; partial tails are retained; inline commands work with bare LF |
-| `DatabaseTest` | Expiry semantics on a fake clock; `INCR` rejects non-canonical numbers; 100 virtual threads incrementing one key lose no updates |
-| `SortedSetTest` | Skip list agrees with a `TreeSet` oracle on order, membership **and rank** over randomised workloads; span invariants verified independently; survives a full insert-then-delete cycle |
-| `ExpiryManagerTest` | Unread keys are still reclaimed; live keys are untouched; the cursor covers the whole keyspace; one cycle's work is bounded |
-| `GlobMatcherTest` | Redis glob syntax, including that a pathological pattern stays fast rather than backtracking exponentially |
-| `ServerCompatibilityIT` | **Jedis** drives the real server over a socket across all five types: binary safety, 1 MB values, unicode, TTL conventions, `WRONGTYPE` for every mismatched pair, 500-command pipelines |
-| `AofPersistenceIT` | Data survives restart; deletions are replayed; a failed `SETNX` is *not* persisted; a truncated trailing record is discarded and the file repaired; every fsync policy produces a replayable file |
+| `RespCodecTest` | Every RESP2 type encodes and parses; malformed input rejected rather than guessed at; encode→parse round-trips including binary and UTF-8 |
+| `IncrementalParseTest` | Frames survive arbitrary fragmentation, **fed one byte at a time**; an incomplete parse consumes nothing; all 30 split points of a `SET`; inline commands with bare LF |
+| `DatabaseTest` | Expiry on a fake clock; `INCR` rejects non-canonical numbers; **100 virtual threads × 1000 increments lose nothing** |
+| `SortedSetTest` | Skip list agrees with a `TreeSet` oracle on order, membership **and rank**; span invariants verified independently |
+| `ExpiryManagerTest` | Unread keys still reclaimed; live keys untouched; cursor covers the keyspace; cycle work is bounded |
+| `GlobMatcherTest` | Redis glob syntax; a pathological pattern stays fast rather than backtracking exponentially |
+| `CompatibilitySuite` | **Jedis** drives the real server across all five types — run twice, **once per concurrency model** |
+| `EventLoopStressIT` | 16 MB replies; a slow reader pinned in `OP_WRITE`; **a CPU-time assertion that catches a spinning selector**; 200 concurrent clients; RST disconnects; 10,000-command pipeline checked reply by reply |
+| `AofPersistenceIT` | Restart; replayed deletions; restored TTLs; truncated tail repaired; **a failed `SETNX` is not persisted** |
 
-Expiry is tested with an injected clock rather than `Thread.sleep`, which keeps the suite
-fast and removes a class of flakiness on loaded CI machines.
+---
 
-## Options
+## Documentation
+
+| Document | For |
+|---|---|
+| **[docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md)** | The system explained from first principles, start to finish — architecture, request lifecycle, every subsystem, and what to learn before each part |
+| **[docs/INTERVIEW_GUIDE.md](docs/INTERVIEW_GUIDE.md)** | Reasoning chains rather than memorised answers |
+| **[docs/benchmarks.md](docs/benchmarks.md)** | Method, environment, results, and an explicit list of what they do *not* prove |
+| **[docs/adr/](docs/adr/)** | Six decision records: why two models, why no dependencies, why an incremental parser, why a skip list, why AOF, why a cursor for expiry |
+
+---
+
+## Running it
 
 ```
 -p, --port <n>            port to listen on (default 6380)
 -b, --bind <addr>         address to bind (default 127.0.0.1)
--m, --mode <mode>         virtual | eventloop        (eventloop lands on day 3)
+-m, --mode <mode>         virtual (default) | eventloop
     --max-clients <n>     maximum concurrent connections (default 10000)
     --appendonly <path>   enable AOF persistence at this path
     --fsync <policy>      always | everysec (default) | no
     --expiry-interval <n> active expiry cycle interval in ms (default 100)
 -v, --verbose             log each connection
 ```
+
+Docker, including real Redis alongside for comparison:
+
+```bash
+docker compose up --build
+redis-cli -p 6380   # virtual threads
+redis-cli -p 6381   # event loop
+redis-cli -p 6379   # real Redis
+```
+
+---
+
+## What this is not
+
+Stated plainly, because a project that overclaims is worse than one that does less
+honestly.
+
+There is **no** replication, clustering, transactions (`MULTI`), Lua scripting, pub/sub,
+blocking commands (`BLPOP`), `SCAN` cursors, RESP3, or RDB snapshots. One database rather
+than sixteen. It is a learning and benchmarking project, not a Redis replacement.
+
+`INFO` reports `redis_version:7.0.0` as a compatibility shim, because clients gate feature
+detection on that field; `server_name` and `resp_server_version` alongside it say what this
+actually is.
+
+### Known limitations
+
+- **`MSET` is not atomic across keys** under the virtual-thread model. Single-key commands
+  are atomic — the store does read-modify-write inside `ConcurrentHashMap.compute` — but
+  multi-key commands write one key at a time. Real Redis avoids this by being
+  single-threaded. The event-loop mode does not have the problem.
+- **The AOF is never rewritten.** It grows with the number of writes, not the size of the
+  data: a counter incremented a million times is one key but a million records. This is the
+  largest gap in the persistence story.
+- **AOF appends serialise on one lock**, because the log must record the same order the
+  keyspace applied. Under many concurrent writers that is a real bottleneck.
+- **Active expiry uses a rotating cursor, not random sampling.** `ConcurrentHashMap` has no
+  O(1) random selection and a parallel TTL index would add hot-path bookkeeping to speed up
+  a background task. Same eventual coverage, bounded work, some wasted looks at keys with
+  no TTL.
+- **The virtual-thread mode's ~55k ops/sec plateau is explained by inference, not by
+  profiling.** See `docs/benchmarks.md`.
+
+---
 
 ## Requirements
 
