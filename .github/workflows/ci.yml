@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '21'
           distribution: 'temurin'
@@ -25,31 +25,48 @@ jobs:
       - name: Build, unit tests and integration tests
         run: mvn -B -ntp verify
 
-      # The integration tests already drive the server with Jedis. This step is a
-      # different kind of check: it proves the packaged jar works against the *official*
-      # client binary, outside the JVM and outside the test harness. If the two ever
-      # disagree, the fault is in the test setup rather than the protocol.
+      # The integration tests already drive the server with Jedis. This is a different
+      # kind of check: it proves the packaged jar works against the *official* client
+      # binary, outside the JVM and outside the test harness. If the two ever disagree,
+      # the fault is in the test setup rather than the protocol.
       - name: Install the official Redis client
         run: sudo apt-get update && sudo apt-get install -y redis-tools
 
-      - name: Smoke test the packaged jar with redis-cli
+      - name: Smoke test both concurrency modes with redis-cli
         run: |
-          java -jar target/resp-server.jar --port 6380 &
-          SERVER_PID=$!
-          trap 'kill $SERVER_PID' EXIT
+          set -e
+          for mode in virtual eventloop; do
+            echo "--- $mode ---"
+            java -jar target/resp-server.jar --port 6380 --mode "$mode" &
+            SERVER_PID=$!
 
-          for _ in $(seq 1 50); do
-            redis-cli -p 6380 PING >/dev/null 2>&1 && break
-            sleep 0.2
+            for _ in $(seq 1 50); do
+              redis-cli -p 6380 PING >/dev/null 2>&1 && break
+              sleep 0.2
+            done
+
+            test "$(redis-cli -p 6380 PING)" = "PONG"
+            test "$(redis-cli -p 6380 SET ci-key ci-value)" = "OK"
+            test "$(redis-cli -p 6380 GET ci-key)" = "ci-value"
+            test "$(redis-cli -p 6380 INCR ci-counter)" = "1"
+            test "$(redis-cli -p 6380 RPUSH ci-list a b c)" = "3"
+            test "$(redis-cli -p 6380 LLEN ci-list)" = "3"
+            test "$(redis-cli -p 6380 ZADD ci-zset 1 a)" = "1"
+            test "$(redis-cli -p 6380 ZSCORE ci-zset a)" = "1"
+            test "$(redis-cli -p 6380 DBSIZE)" = "4"
+            # Inline commands over a raw socket, terminated by a bare LF.
+            printf 'PING\n' | timeout 5 nc -w 2 127.0.0.1 6380 | grep -q PONG
+
+            kill $SERVER_PID
+            wait $SERVER_PID 2>/dev/null || true
+            echo "$mode: ok"
           done
 
-          set -e
-          test "$(redis-cli -p 6380 PING)" = "PONG"
-          test "$(redis-cli -p 6380 SET ci-key ci-value)" = "OK"
-          test "$(redis-cli -p 6380 GET ci-key)" = "ci-value"
-          test "$(redis-cli -p 6380 INCR ci-counter)" = "1"
-          test "$(redis-cli -p 6380 DBSIZE)" = "2"
-          echo "redis-cli smoke test passed"
+      - name: Verify AOF crash recovery
+        run: ./scripts/crash-recovery-demo.sh 6383
+
+      - name: Build the Docker image
+        run: docker build -t resp-server:ci .
 
       - name: Upload test reports on failure
         if: failure()

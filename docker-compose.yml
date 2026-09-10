@@ -1,0 +1,55 @@
+# Brings up both concurrency modes side by side, plus real Redis for comparison.
+#
+#   docker compose up --build
+#   redis-cli -p 6380   # virtual threads
+#   redis-cli -p 6381   # event loop
+#   redis-cli -p 6379   # real Redis
+
+services:
+  resp-server-virtual:
+    build: .
+    container_name: resp-server-virtual
+    ports:
+      - "6380:6380"
+    command: ["--port", "6380", "--mode", "virtual", "--appendonly", "/data/appendonly.aof"]
+    volumes:
+      - virtual-data:/data
+    healthcheck:
+      # No redis-cli in the image, so speak the protocol directly. An inline PING is
+      # enough, and the server answers inline commands.
+      test: ["CMD-SHELL", "printf 'PING\\r\\n' | timeout 2 nc -w 2 127.0.0.1 6380 | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  resp-server-eventloop:
+    build: .
+    container_name: resp-server-eventloop
+    ports:
+      - "6381:6381"
+    command: ["--port", "6381", "--mode", "eventloop", "--appendonly", "/data/appendonly.aof"]
+    volumes:
+      - eventloop-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'PING\\r\\n' | timeout 2 nc -w 2 127.0.0.1 6381 | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:8.0.5-alpine
+    container_name: resp-server-redis-reference
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  virtual-data:
+  eventloop-data:
