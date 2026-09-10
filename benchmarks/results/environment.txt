@@ -1,0 +1,13 @@
+date            : 2026-09-10 04:38:46 UTC
+kernel          : Linux 6.18.33.2-microsoft-standard-WSL2
+distro          : Ubuntu 26.04 LTS
+cpu             : 11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz
+cpu cores       : 8
+memory          : 3.7Gi
+java            : openjdk version "21.0.12" 2026-07-21
+jvm flags       : -XX:+UseG1GC
+redis-server    : Redis server v=8.0.5
+redis-benchmark : redis-benchmark 8.0.5
+resp-server     : c44e36d
+runs per config : 3 (plus one discarded warmup)
+transport       : loopback, all subjects native on one host
