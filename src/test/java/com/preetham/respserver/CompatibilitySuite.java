@@ -38,15 +38,27 @@ import redis.clients.jedis.exceptions.JedisDataException;
  * <p>The server binds port 0 so the OS assigns a free port. Hard-coding one makes the
  * suite fail whenever a stray server is running, and scanning for a free port has an
  * inherent race between the check and the bind.
+ *
+ * <h2>Why this suite is abstract</h2>
+ *
+ * Every test here runs twice, once per concurrency model, through
+ * {@code VirtualThreadServerIT} and {@code EventLoopServerIT}. That is not padding: the
+ * benchmark comparing the two models is only meaningful if they are behaviourally
+ * identical, and the two share nothing below the transport. Writing the assertions once
+ * and running them against both is what turns "they should behave the same" into
+ * something the build actually enforces.
  */
-class ServerCompatibilityIT {
+abstract class CompatibilitySuite {
+
+    /** The concurrency model under test. Supplied by each concrete subclass. */
+    protected abstract ServerConfig.ServerMode mode();
 
     private RedisServer server;
     private Jedis jedis;
 
     @BeforeEach
     void startServer() throws IOException {
-        ServerConfig config = ServerConfig.forTests(ServerConfig.ServerMode.VIRTUAL_THREADS);
+        ServerConfig config = ServerConfig.forTests(mode());
 
         Database database = new Database();
         CommandRegistry registry = CommandRegistry.standard();
