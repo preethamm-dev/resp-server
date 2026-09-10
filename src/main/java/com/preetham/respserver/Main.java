@@ -62,6 +62,18 @@ public final class Main {
         ExpiryManager expiry = new ExpiryManager(database);
         expiry.start(Duration.ofMillis(config.expiryIntervalMillis()));
 
+        // Wire live counters into INFO. Suppliers rather than values, so INFO always
+        // reports the current state instead of a snapshot taken at startup.
+        stats.describeMode(config.mode() == ServerConfig.ServerMode.VIRTUAL_THREADS
+                ? "virtual-threads" : "event-loop");
+        stats.trackExpiry(expiry::keysReaped, expiry::cyclesRun);
+        if (aof != null) {
+            AofWriter writer = aof;
+            stats.describePersistence(
+                    config.fsyncPolicy().name().toLowerCase(java.util.Locale.ROOT));
+            stats.trackAof(writer::commandsAppended, writer::syncs);
+        }
+
         CommandExecutor executor = new CommandExecutor(registry, database, stats, aof);
         RedisServer server = ServerFactory.create(config, executor, stats);
 
@@ -109,7 +121,7 @@ public final class Main {
                 ? "virtual threads (one per connection)"
                 : "event loop (single-threaded NIO)";
 
-        System.out.println("resp-server 0.2.0");
+        System.out.println("resp-server 0.3.0");
         System.out.println("  listening   " + config.bindAddress() + ":" + server.port());
         System.out.println("  mode        " + mode);
         System.out.println("  commands    " + registry.size());

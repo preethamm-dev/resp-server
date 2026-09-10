@@ -3,6 +3,7 @@ package com.preetham.respserver.stats;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongSupplier;
 
 /**
  * Counters backing the {@code INFO} command.
@@ -18,6 +19,22 @@ import java.util.concurrent.atomic.LongAdder;
  * and down and is read as a live gauge, which {@code LongAdder} does not suit.
  */
 public final class ServerStats {
+
+    /**
+     * Descriptive server state for {@code INFO}, wired up at startup.
+     *
+     * <p>Held as suppliers rather than copied values so {@code INFO} always reports live
+     * counters. Making {@code ServerStats} depend on {@code ExpiryManager} and
+     * {@code AofWriter} directly would couple the counters to two subsystems that may not
+     * exist -- persistence is optional -- and would drag their packages into everything
+     * that touches statistics.
+     */
+    private volatile String mode = "unknown";
+    private volatile String persistence = "disabled";
+    private volatile LongSupplier expiredKeys = () -> 0L;
+    private volatile LongSupplier expiryCycles = () -> 0L;
+    private volatile LongSupplier aofCommands = () -> 0L;
+    private volatile LongSupplier aofSyncs = () -> 0L;
 
     private final long startNanos = System.nanoTime();
     private final LongAdder totalConnections = new LongAdder();
@@ -69,5 +86,49 @@ public final class ServerStats {
 
     public long uptimeSeconds() {
         return Duration.ofNanos(System.nanoTime() - startNanos).toSeconds();
+    }
+
+    // ---- descriptive state, wired at startup -----------------------------------
+
+    public void describeMode(String mode) {
+        this.mode = mode;
+    }
+
+    public void describePersistence(String persistence) {
+        this.persistence = persistence;
+    }
+
+    public void trackExpiry(LongSupplier keysReaped, LongSupplier cycles) {
+        this.expiredKeys = keysReaped;
+        this.expiryCycles = cycles;
+    }
+
+    public void trackAof(LongSupplier commandsAppended, LongSupplier syncs) {
+        this.aofCommands = commandsAppended;
+        this.aofSyncs = syncs;
+    }
+
+    public String mode() {
+        return mode;
+    }
+
+    public String persistence() {
+        return persistence;
+    }
+
+    public long expiredKeys() {
+        return expiredKeys.getAsLong();
+    }
+
+    public long expiryCycles() {
+        return expiryCycles.getAsLong();
+    }
+
+    public long aofCommands() {
+        return aofCommands.getAsLong();
+    }
+
+    public long aofSyncs() {
+        return aofSyncs.getAsLong();
     }
 }

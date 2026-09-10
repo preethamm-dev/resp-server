@@ -125,29 +125,58 @@ public final class ConnectionCommands {
      */
     private static RespValue info(CommandContext ctx) {
         ServerStats stats = ctx.stats();
+        Runtime runtime = Runtime.getRuntime();
         String text = String.join("\r\n",
                 "# Server",
                 "redis_version:7.0.0",
                 "server_name:resp-server",
-                "resp_server_version:0.2.0",
+                "resp_server_version:0.3.0",
+                "concurrency_model:" + stats.mode(),
                 "os:" + System.getProperty("os.name"),
                 "arch_bits:64",
                 "process_id:" + ProcessHandle.current().pid(),
                 "uptime_in_seconds:" + stats.uptimeSeconds(),
                 "java_version:" + System.getProperty("java.version"),
+                "java_vm:" + System.getProperty("java.vm.name"),
                 "",
                 "# Clients",
                 "connected_clients:" + stats.connectedClients(),
+                "",
+                "# Memory",
+                "used_memory:" + (runtime.totalMemory() - runtime.freeMemory()),
+                "used_memory_human:" + humanBytes(runtime.totalMemory() - runtime.freeMemory()),
+                "jvm_heap_max:" + runtime.maxMemory(),
+                "",
+                "# Persistence",
+                "aof_enabled:" + (stats.persistence().equals("disabled") ? 0 : 1),
+                "aof_policy:" + stats.persistence(),
+                "aof_commands_written:" + stats.aofCommands(),
+                "aof_fsyncs:" + stats.aofSyncs(),
                 "",
                 "# Stats",
                 "total_connections_received:" + stats.totalConnections(),
                 "total_commands_processed:" + stats.totalCommands(),
                 "rejected_connections:" + stats.rejectedConnections(),
                 "protocol_errors:" + stats.protocolErrors(),
+                "expired_keys:" + stats.expiredKeys(),
+                "expiry_cycles:" + stats.expiryCycles(),
                 "",
                 "# Keyspace",
                 "db0:keys=" + ctx.db().size(),
                 "");
         return RespValue.bulk(text);
+    }
+
+    private static String humanBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + "B";
+        }
+        if (bytes < 1024 * 1024) {
+            return String.format(Locale.ROOT, "%.2fK", bytes / 1024.0);
+        }
+        if (bytes < 1024L * 1024 * 1024) {
+            return String.format(Locale.ROOT, "%.2fM", bytes / (1024.0 * 1024));
+        }
+        return String.format(Locale.ROOT, "%.2fG", bytes / (1024.0 * 1024 * 1024));
     }
 }
