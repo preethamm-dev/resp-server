@@ -23,8 +23,7 @@ public final class ServerFactory {
                                      ServerStats stats) {
         return switch (config.mode()) {
             case VIRTUAL_THREADS -> new VirtualThreadServer(config, executor, stats);
-            case EVENT_LOOP -> throw new UnsupportedOperationException(
-                    "the event-loop server is not implemented yet; use --mode virtual");
+            case EVENT_LOOP -> new EventLoopServer(config, executor, stats);
         };
     }
 }
